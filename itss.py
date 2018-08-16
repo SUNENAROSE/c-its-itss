@@ -43,13 +43,37 @@ class ITSS(object):
 		if not os.path.isdir(cert_dir):
 			os.mkdir(cert_dir)
 
+		self.Engine = None
+
+		# Initialize HSM engine
+		print("Loading HSM engine")
+		backend = cryptography.hazmat.backends.default_backend()
+		backend._lib.ENGINE_load_dynamic()
+		engine = backend._lib.ENGINE_by_id(b"dynamic");
+		backend.openssl_assert(engine != backend._ffi.NULL)
+		engine = backend._ffi.gc(engine, backend._lib.ENGINE_free)
+
+		backend._lib.ENGINE_ctrl_cmd_string(engine, b"SO_PATH", b"/usr/lib/arm-linux-gnueabihf/engines-1.1/libpkcs11.so", 0)
+		backend._lib.ENGINE_ctrl_cmd_string(engine, b"ID", b"pkcs11", 0)
+		backend._lib.ENGINE_ctrl_cmd_string(engine, b"LOAD", backend._ffi.NULL, 0)
+		backend._lib.ENGINE_ctrl_cmd_string(engine, b"MODULE_PATH", b"/usr/lib/cicada-pkcs11.so", 0)
+		res = backend._lib.ENGINE_init(engine)
+		backend.openssl_assert(res > 0)
+
+		self.Engine = engine
+
 
 	def generate_private_key(self):
-		self.PrivateKey = cryptography.hazmat.primitives.asymmetric.ec.generate_private_key(
-			cryptography.hazmat.primitives.asymmetric.ec.SECP256R1(),
-			cryptography.hazmat.backends.default_backend()
-		)
+		if self.Engine is None:
+			self.PrivateKey = cryptography.hazmat.primitives.asymmetric.ec.generate_private_key(
+				cryptography.hazmat.primitives.asymmetric.ec.SECP256R1(),
+				cryptography.hazmat.backends.default_backend()
+			)
+		else:
+			raise RuntimeError("Not implemented yet!")
+
 		self.EC = None
+		self.AT = None
 
 
 	def enroll(self):
@@ -246,12 +270,15 @@ class ITSS(object):
 
 
 	def store(self):
-		x = self.PrivateKey.private_bytes(
-			encoding=cryptography.hazmat.primitives.serialization.Encoding.DER,
-			format=cryptography.hazmat.primitives.serialization.PrivateFormat.PKCS8,
-			encryption_algorithm=cryptography.hazmat.primitives.serialization.BestAvailableEncryption(b'strong-and-secret :-)')
-		)
-		open(os.path.join(self.Directory, 'itss.key'),'wb').write(x)
+		if self.Engine is not None:
+			pass # Don't save anything when on HSM
+		else:
+			x = self.PrivateKey.private_bytes(
+				encoding=cryptography.hazmat.primitives.serialization.Encoding.DER,
+				format=cryptography.hazmat.primitives.serialization.PrivateFormat.PKCS8,
+				encryption_algorithm=cryptography.hazmat.primitives.serialization.BestAvailableEncryption(b'strong-and-secret :-)')
+			)
+			open(os.path.join(self.Directory, 'itss.key'),'wb').write(x)
 
 		if self.EC is not None:
 			open(os.path.join(self.Directory, 'itss.ec'),'wb').write(self.EC.Data)
@@ -269,14 +296,28 @@ class ITSS(object):
 		assert(self.EC is None)
 		assert(self.AT is None)
 
-		try:
-			self.PrivateKey = cryptography.hazmat.primitives.serialization.load_der_private_key(
-				open(os.path.join(self.Directory, 'itss.key'),'rb').read(),
-				password=b'strong-and-secret :-)',
-				backend=cryptography.hazmat.backends.default_backend()
+		if self.Engine is not None:
+			p11uri = "pkcs11:object=test-key;type=private"
+			backend = cryptography.hazmat.backends.default_backend()
+			pkey = backend._lib.ENGINE_load_private_key(
+				self.Engine,
+				p11uri.encode("utf-8"),
+				backend._ffi.NULL,
+				backend._ffi.NULL
 			)
-		except:
-			return False
+			backend.openssl_assert(pkey != backend._ffi.NULL)
+			pkey = backend._ffi.gc(pkey, backend._lib.EVP_PKEY_free)
+			self.P11URI = p11uri
+			self.PrivateKey = backend._evp_pkey_to_private_key(pkey)
+		else:
+			try:
+				self.PrivateKey = cryptography.hazmat.primitives.serialization.load_der_private_key(
+					open(os.path.join(self.Directory, 'itss.key'),'rb').read(),
+					password=b'strong-and-secret :-)',
+					backend=cryptography.hazmat.backends.default_backend()
+				)
+			except:
+				return False
 
 		try:
 			ecraw = open(os.path.join(self.Directory, 'itss.ec'),'rb').read()
